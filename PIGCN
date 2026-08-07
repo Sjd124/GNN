@@ -1,0 +1,253 @@
+"""
+Graph Neural Network with Physics-Informed Learning (PINN) for Property Prediction
+Simplified version with basic physics constraints
+"""
+
+import os.path as osp
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch_geometric.data import Data, Dataset
+from torch_geometric.loader import DataLoader
+from torch_geometric.nn import global_max_pool, GCNConv
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+from sklearn import preprocessing
+import numpy as np
+import random
+import time
+import os
+
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+# ========== Configuration ==========
+CONCENTRATION_VALUE = 2.0
+DATA_PATH = './data/'
+RESULT_DIR = './results/'
+BATCH_SIZE = 7
+NUM_EPOCHS = 2000
+LEARNING_RATE = 1e-4
+TRAIN_SPLIT = 0.8
+# ==================================
+
+os.makedirs(RESULT_DIR, exist_ok=True)
+os.makedirs(DATA_PATH, exist_ok=True)
+
+
+class SimpleGCNWithPhysics(torch.nn.Module):
+    """Simple GCN with basic physics constraints"""
+
+    def __init__(self):
+        super().__init__()
+        torch.manual_seed(1234)
+
+        # Learnable physics parameter (simplified)
+        self.lambda_phys = nn.Parameter(torch.tensor([1.0], dtype=torch.float32))
+
+        # GCN layers
+        self.conv1 = GCNConv(11, 7)
+        self.conv2 = GCNConv(7, 4)
+        self.conv3 = GCNConv(4, 2)
+        self.property = nn.Linear(2, 1)
+
+    def forward(self, x, edge_index, batch, concentration):
+        """Forward pass with concentration"""
+        if concentration.shape[0] == 1:
+            batch_size = batch.max().item() + 1
+            concentration = concentration.repeat(batch_size, 1)
+
+        conc_expanded = concentration.repeat_interleave(
+            torch.bincount(batch), dim=0
+        )
+
+        x_combined = torch.cat([x, conc_expanded], dim=1)
+
+        h = torch.relu(self.conv1(x_combined, edge_index))
+        h = torch.relu(self.conv2(h, edge_index))
+        h = torch.relu(self.conv3(h, edge_index))
+        h = global_max_pool(h, batch)
+        out = self.property(h)
+
+        return out, h
+
+
+def get_graph_targets(data):
+    """Extract graph-level targets"""
+    return data.y.float().view(-1)
+
+
+def physics_loss(model, x, edge_index, batch, concentration_value):
+    """Simplified physics loss"""
+    concentration = torch.tensor([[concentration_value]], dtype=torch.float, device=x.device)
+    concentration.requires_grad_(True)
+
+    y, _ = model(x, edge_index, batch, concentration)
+
+    # Compute gradient with respect to concentration
+    y_c = torch.autograd.grad(
+        y, concentration,
+        grad_outputs=torch.ones_like(y),
+        create_graph=True,
+        retain_graph=True
+    )[0]
+
+
+    phys_loss = torch.mean((y_c - model.lambda_phys) ** 2)
+
+    return phys_loss
+
+
+def train_epoch(loader, model, optimizer, criterion, concentration_value, phys_weight=0.01):
+    """Train for one epoch with physics constraint"""
+    model.train()
+    total_loss = total_data_loss = total_phys_loss = 0.0
+    total_graphs = 0
+
+    for batch in loader:
+        batch = batch.to(device)
+        optimizer.zero_grad()
+
+        concentration_tensor = torch.tensor([[concentration_value]], dtype=torch.float, device=device)
+
+        out, _ = model(batch.x, batch.edge_index, batch.batch, concentration_tensor)
+        pred = out.squeeze(-1)
+        target = get_graph_targets(batch)
+
+        # Data loss
+        data_loss = criterion(pred, target)
+
+        # Physics loss (with small weight)
+        phys_loss = physics_loss(
+            model, batch.x, batch.edge_index, batch.batch, concentration_value
+        )
+
+        # Total loss
+        total_loss_batch = data_loss + phys_weight * phys_loss
+        total_loss_batch.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+
+        n = target.numel()
+        total_loss += total_loss_batch.item() * n
+        total_data_loss += data_loss.item() * n
+        total_phys_loss += phys_loss.item() * n
+        total_graphs += n
+
+    return (total_loss / total_graphs,
+            total_data_loss / total_graphs,
+            total_phys_loss / total_graphs)
+
+
+@torch.no_grad()
+def evaluate(loader, model, concentration_value):
+    """Evaluate model performance"""
+    model.eval()
+    all_pred, all_target = [], []
+    concentration_tensor = torch.tensor([[concentration_value]], dtype=torch.float, device=device)
+
+    for batch in loader:
+        batch = batch.to(device)
+        out, _ = model(batch.x, batch.edge_index, batch.batch, concentration_tensor)
+        all_pred.append(out.squeeze(-1).cpu())
+        all_target.append(get_graph_targets(batch).cpu())
+
+    pred = torch.cat(all_pred).numpy()
+    target = torch.cat(all_target).numpy()
+
+    return (mean_absolute_error(target, pred),
+            np.sqrt(mean_squared_error(target, pred)),
+            r2_score(target, pred))
+
+
+def main():
+    """Main training function"""
+    # Initialize datasets
+    dataset = CustomDataset()
+    dataset.process()
+
+    # Initialize model
+    model = SimpleGCNWithPhysics().to(device)
+    print("Initialized model with physics constraint")
+
+    # Split dataset
+    indices = list(range(len(dataset)))
+    random.shuffle(indices)
+    split_idx = int(len(dataset) * TRAIN_SPLIT)
+    train_indices, val_indices = indices[:split_idx], indices[split_idx:]
+
+    train_dataset = dataset[train_indices]
+    val_dataset = dataset[val_indices]
+
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    train_eval_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    # Setup training
+    criterion = torch.nn.MSELoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+
+    # Initialize CSV records
+    init_loss_record()
+    init_evaluation_record()
+
+    # Training loop
+    print(f"\nStarting training with concentration = {CONCENTRATION_VALUE}")
+    print(f"Training samples: {len(train_dataset)}, Validation samples: {len(val_dataset)}")
+    print("-" * 80)
+
+    start_time = time.time()
+
+    for epoch in range(NUM_EPOCHS):
+        train_loss, data_loss, phys_loss = train_epoch(
+            train_loader, model, optimizer, criterion, CONCENTRATION_VALUE
+        )
+
+        # Log losses
+        loss_record = pd.DataFrame([{
+            'epoch': epoch + 1,
+            'total_loss': train_loss,
+            'data_loss': data_loss,
+            'physics_loss': phys_loss
+        }])
+        loss_record.to_csv(LOSS_RECORD_FILE, mode='a', header=False, index=False)
+
+        # Print progress
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch + 1:04d} | Loss: {train_loss:.6f} | "
+                  f"Phys: {phys_loss:.6f} | λ: {model.lambda_phys.item():.4f}")
+
+        # Evaluate and log metrics
+        if (epoch + 1) % 50 == 0:
+            train_mae, train_rmse, train_r2 = evaluate(train_eval_loader, model, CONCENTRATION_VALUE)
+            val_mae, val_rmse, val_r2 = evaluate(val_loader, model, CONCENTRATION_VALUE)
+
+            eval_record = pd.DataFrame([{
+                'epoch': epoch + 1,
+                'train_mae': train_mae,
+                'train_rmse': train_rmse,
+                'train_r2': train_r2,
+                'val_mae': val_mae,
+                'val_rmse': val_rmse,
+                'val_r2': val_r2
+            }])
+            eval_record.to_csv(EVALUATION_RECORD_FILE, mode='a', header=False, index=False)
+
+            print(f"  Train MAE: {train_mae:.6f} | RMSE: {train_rmse:.6f} | R²: {train_r2:.4f}")
+            print(f"  Val   MAE: {val_mae:.6f} | RMSE: {val_rmse:.6f} | R²: {val_r2:.4f}")
+
+    # Save model
+    torch.save(model, os.path.join(RESULT_DIR, 'model_final.pt'))
+
+    # Final evaluation
+    final_mae, final_rmse, final_r2 = evaluate(val_loader, model, CONCENTRATION_VALUE)
+    print("\n" + "=" * 80)
+    print(f"Final Results:")
+    print(f"MAE: {final_mae:.6f} | RMSE: {final_rmse:.6f} | R²: {final_r2:.4f}")
+    print(f"Training time: {time.time() - start_time:.2f} seconds")
+    print("=" * 80)
+
+
+if __name__ == "__main__":
+    main()
